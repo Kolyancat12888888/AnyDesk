@@ -6,7 +6,6 @@ using System.IO;
 using System.Net;
 using System.Net.Http;
 using System.Runtime.InteropServices;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -31,15 +30,16 @@ namespace AnyDeskInspector
         [JsonPropertyName("message")] public string? Message { get; set; }
     }
 
-    public class ConnectionItem
+    public class SessionEvent
     {
-        public string Time { get; set; } = "";
-        public string Source { get; set; } = "";
-        public string Ip { get; set; } = "";
-        public string Location { get; set; } = "";
-        public string Isp { get; set; } = "";
-        public string Org { get; set; } = "";
-        public string Details { get; set; } = "";
+        public string Timestamp { get; set; } = "";
+        public string EventType { get; set; } = "";
+        public string RemoteAnyDeskId { get; set; } = "Неизвестен";
+        public string RemoteIp { get; set; } = "Через релей AnyDesk";
+        public string Location { get; set; } = "-";
+        public string IspOrg { get; set; } = "-";
+        public string ConnectionType { get; set; } = "Relay / Не определен";
+        public string LogSource { get; set; } = "";
         public GeoIpResponse? Geo { get; set; }
     }
 
@@ -47,64 +47,67 @@ namespace AnyDeskInspector
     {
         private DataGridView grid;
         private Label lblStatus;
-        private Button btnStartMonitor;
-        private Button btnStopMonitor;
-        private Button btnScanHistory;
+        private Label lblSessionCount;
+        private Button btnLiveProtect;
+        private Button btnStopProtect;
+        private Button btnScanRealSessions;
         private Button btnKillAnyDesk;
         private Button btnExportHtml;
-        private Button btnExportPolice;
-        private System.Windows.Forms.Timer monitorTimer;
+        private System.Windows.Forms.Timer liveLogWatcherTimer;
+        
         private readonly HttpClient httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
-        private readonly HashSet<string> seenIps = new HashSet<string>();
-        private readonly List<ConnectionItem> allItems = new List<ConnectionItem>();
-        private bool isMonitoring = false;
+        private readonly List<SessionEvent> sessionList = new List<SessionEvent>();
+        private readonly HashSet<string> seenSessionKeys = new HashSet<string>();
+        private long lastLogPosition = 0;
+        private string? activeLogPath = null;
 
         public MainForm()
         {
             InitializeComponent();
+            FindActiveLogFile();
         }
 
         private void InitializeComponent()
         {
-            this.Text = "🛡️ AnyDesk Anti-Scam & Forensic Inspector";
-            this.Size = new Size(1020, 640);
-            this.MinimumSize = new Size(850, 500);
+            this.Text = "🛡️ AnyDesk Anti-Scam Inspector (Точный детектор сессий)";
+            this.Size = new Size(1100, 650);
+            this.MinimumSize = new Size(900, 520);
             this.StartPosition = FormStartPosition.CenterScreen;
-            this.BackColor = Color.FromArgb(245, 247, 250);
+            this.BackColor = Color.FromArgb(246, 248, 251);
             this.Font = new Font("Segoe UI", 9.5f, FontStyle.Regular);
 
-            // Верхняя панель кнопок
+            // Верхняя панель
             var topPanel = new Panel
             {
                 Dock = DockStyle.Top,
-                Height = 80,
+                Height = 85,
                 Padding = new Padding(12),
                 BackColor = Color.White
             };
 
-            btnStartMonitor = CreateStyledButton("▶ Включить защиту (Live)", Color.FromArgb(40, 167, 69), Color.White, 200);
-            btnStartMonitor.Click += (s, e) => ToggleMonitoring(true);
+            btnLiveProtect = CreateStyledButton("▶ Включить защиту сессий", Color.FromArgb(40, 167, 69), Color.White, 220);
+            btnLiveProtect.Click += (s, e) => ToggleLiveProtection(true);
 
-            btnStopMonitor = CreateStyledButton("⏸ Пауза", Color.FromArgb(108, 117, 125), Color.White, 100);
-            btnStopMonitor.Enabled = false;
-            btnStopMonitor.Click += (s, e) => ToggleMonitoring(false);
+            btnStopProtect = CreateStyledButton("⏸ Пауза", Color.FromArgb(108, 117, 125), Color.White, 100);
+            btnStopProtect.Enabled = false;
+            btnStopProtect.Click += (s, e) => ToggleLiveProtection(false);
 
-            btnScanHistory = CreateStyledButton("📜 История подключений (Логи)", Color.FromArgb(0, 123, 255), Color.White, 220);
-            btnScanHistory.Click += async (s, e) => await ScanLogsAsync();
+            btnScanRealSessions = CreateStyledButton("🔍 Найти реальные сессии в истории", Color.FromArgb(0, 123, 255), Color.White, 260);
+            btnScanRealSessions.Click += async (s, e) => await LoadActualSessionsFromLogsAsync();
 
-            btnKillAnyDesk = CreateStyledButton("🚨 ЭКСТРЕННО УБИТЬ ANYDESK", Color.FromArgb(220, 53, 69), Color.White, 240);
+            btnKillAnyDesk = CreateStyledButton("🚨 ЭКСТРЕННО СБРОСИТЬ СЕССИЮ", Color.FromArgb(220, 53, 69), Color.White, 250);
             btnKillAnyDesk.Font = new Font("Segoe UI", 9.5f, FontStyle.Bold);
             btnKillAnyDesk.Click += (s, e) => KillAnyDesk();
 
-            topPanel.Controls.Add(btnStartMonitor);
-            topPanel.Controls.Add(btnStopMonitor);
-            topPanel.Controls.Add(btnScanHistory);
+            topPanel.Controls.Add(btnLiveProtect);
+            topPanel.Controls.Add(btnStopProtect);
+            topPanel.Controls.Add(btnScanRealSessions);
             topPanel.Controls.Add(btnKillAnyDesk);
 
-            btnStartMonitor.Location = new Point(12, 18);
-            btnStopMonitor.Location = new Point(220, 18);
-            btnScanHistory.Location = new Point(330, 18);
-            btnKillAnyDesk.Location = new Point(560, 18);
+            btnLiveProtect.Location = new Point(12, 20);
+            btnStopProtect.Location = new Point(240, 20);
+            btnScanRealSessions.Location = new Point(350, 20);
+            btnKillAnyDesk.Location = new Point(620, 20);
 
             // Таблица
             grid = new DataGridView
@@ -119,68 +122,60 @@ namespace AnyDeskInspector
                 SelectionMode = DataGridViewSelectionMode.FullRowSelect,
                 AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill
             };
-            grid.DefaultCellStyle.SelectionBackColor = Color.FromArgb(232, 240, 254);
+            grid.DefaultCellStyle.SelectionBackColor = Color.FromArgb(230, 240, 255);
             grid.DefaultCellStyle.SelectionForeColor = Color.Black;
             grid.ColumnHeadersDefaultCellStyle.BackColor = Color.FromArgb(240, 243, 246);
             grid.ColumnHeadersDefaultCellStyle.Font = new Font("Segoe UI", 9.5f, FontStyle.Bold);
-            grid.ColumnHeadersHeight = 35;
+            grid.ColumnHeadersHeight = 36;
             grid.EnableHeadersVisualStyles = false;
 
             grid.Columns.Add("Time", "Время");
-            grid.Columns.Add("Source", "Тип");
-            grid.Columns.Add("Ip", "IP-адрес");
-            grid.Columns.Add("Location", "Локация (Страна / Город)");
-            grid.Columns.Add("Isp", "Провайдер");
-            grid.Columns.Add("Org", "Организация / AS");
-            grid.Columns.Add("Details", "Детали / User ID");
+            grid.Columns.Add("Event", "Статус сессии");
+            grid.Columns.Add("AnyDeskId", "ID оператора (AnyDesk ID)");
+            grid.Columns.Add("Ip", "IP-адрес оператора");
+            grid.Columns.Add("Type", "Тип связи");
+            grid.Columns.Add("Location", "Локация оператора");
+            grid.Columns.Add("Isp", "Провайдер / Сеть");
 
             grid.Columns[0].FillWeight = 110;
-            grid.Columns[1].FillWeight = 90;
-            grid.Columns[2].FillWeight = 110;
-            grid.Columns[3].FillWeight = 160;
-            grid.Columns[4].FillWeight = 140;
-            grid.Columns[5].FillWeight = 140;
-            grid.Columns[6].FillWeight = 200;
+            grid.Columns[1].FillWeight = 130;
+            grid.Columns[2].FillWeight = 140;
+            grid.Columns[3].FillWeight = 120;
+            grid.Columns[4].FillWeight = 110;
+            grid.Columns[5].FillWeight = 150;
+            grid.Columns[6].FillWeight = 160;
 
             // Нижняя панель
             var bottomPanel = new Panel
             {
                 Dock = DockStyle.Bottom,
                 Height = 55,
-                Padding = new Padding(10),
+                Padding = new Padding(12),
                 BackColor = Color.White
             };
 
             lblStatus = new Label
             {
-                Text = "Готов. Нажмите «Включить защиту» для мониторинга в реальном времени.",
+                Text = "Готов. Нажмите «Найти реальные сессии в истории» или запустите защиту в реальном времени.",
                 Dock = DockStyle.Left,
                 AutoSize = true,
                 Font = new Font("Segoe UI", 9.5f, FontStyle.Regular),
-                ForeColor = Color.FromArgb(70, 80, 95)
+                ForeColor = Color.FromArgb(80, 90, 105)
             };
 
-            btnExportHtml = CreateStyledButton("📊 Отчет HTML", Color.FromArgb(23, 162, 184), Color.White, 140);
+            btnExportHtml = CreateStyledButton("📊 Сохранить отчет (HTML)", Color.FromArgb(23, 162, 184), Color.White, 200);
+            btnExportHtml.Dock = DockStyle.Right;
             btnExportHtml.Click += (s, e) => ExportHtmlReport();
 
-            btnExportPolice = CreateStyledButton("📄 Бланк в полицию", Color.FromArgb(108, 117, 125), Color.White, 160);
-            btnExportPolice.Click += (s, e) => ExportPoliceStatement();
-
-            btnExportPolice.Dock = DockStyle.Right;
-            btnExportHtml.Dock = DockStyle.Right;
-
             bottomPanel.Controls.Add(lblStatus);
-            bottomPanel.Controls.Add(btnExportPolice);
             bottomPanel.Controls.Add(btnExportHtml);
 
             this.Controls.Add(grid);
             this.Controls.Add(bottomPanel);
             this.Controls.Add(topPanel);
 
-            // Таймер фонового мониторинга
-            monitorTimer = new System.Windows.Forms.Timer();
-            monitorTimer.Interval = 2000; // каждые 2 сек
-            monitorTimer.Tick += async (s, e) => await CheckActiveConnectionsAsync();
+            liveLogWatcherTimer = new System.Windows.Forms.Timer { Interval = 1500 };
+            liveLogWatcherTimer.Tick += async (s, e) => await CheckLiveLogUpdatesAsync();
         }
 
         private Button CreateStyledButton(string text, Color bg, Color fg, int width)
@@ -199,142 +194,283 @@ namespace AnyDeskInspector
             return btn;
         }
 
-        private void ToggleMonitoring(bool enable)
+        private void FindActiveLogFile()
         {
-            isMonitoring = enable;
-            btnStartMonitor.Enabled = !enable;
-            btnStopMonitor.Enabled = enable;
+            string? appdata = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+            if (!string.IsNullOrEmpty(appdata))
+            {
+                string p = Path.Combine(appdata, "AnyDesk", "ad.trace");
+                if (File.Exists(p)) activeLogPath = p;
+            }
+
+            if (activeLogPath == null)
+            {
+                string? programData = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
+                if (!string.IsNullOrEmpty(programData))
+                {
+                    string p = Path.Combine(programData, "AnyDesk", "ad_svc.trace");
+                    if (File.Exists(p)) activeLogPath = p;
+                }
+            }
+
+            if (activeLogPath != null && File.Exists(activeLogPath))
+            {
+                try { lastLogPosition = new FileInfo(activeLogPath).Length; } catch { }
+            }
+        }
+
+        private void ToggleLiveProtection(bool enable)
+        {
+            btnLiveProtect.Enabled = !enable;
+            btnStopProtect.Enabled = enable;
 
             if (enable)
             {
-                lblStatus.Text = "🟢 Защита АКТИВНА: сканирование сетевых сокетов AnyDesk каждые 2 сек...";
+                FindActiveLogFile();
+                lblStatus.Text = "🟢 Защита ВКЛЮЧЕНА: ожидание реального подключения оператора...";
                 lblStatus.ForeColor = Color.FromArgb(40, 167, 69);
-                monitorTimer.Start();
+                liveLogWatcherTimer.Start();
             }
             else
             {
-                lblStatus.Text = "⏸ Мониторинг на паузе.";
+                lblStatus.Text = "⏸ Защита на паузе.";
                 lblStatus.ForeColor = Color.FromArgb(108, 117, 125);
-                monitorTimer.Stop();
+                liveLogWatcherTimer.Stop();
             }
         }
 
-        private async Task CheckActiveConnectionsAsync()
+        private async Task CheckLiveLogUpdatesAsync()
         {
-            var activeIps = GetActiveAnyDeskConnections();
-            if (activeIps.Count == 0) return;
-
-            foreach (var (ip, port, pid) in activeIps)
+            if (string.IsNullOrEmpty(activeLogPath) || !File.Exists(activeLogPath))
             {
-                if (!seenIps.Contains(ip))
-                {
-                    seenIps.Add(ip);
-                    System.Media.SystemSounds.Exclamation.Play();
-
-                    lblStatus.Text = $"🚨 ОБНАРУЖЕНО ПОДКЛЮЧЕНИЕ: {ip}:{port}!";
-                    lblStatus.ForeColor = Color.Red;
-
-                    var geo = await FetchGeoIpAsync(ip);
-                    string loc = geo?.Status == "success" ? $"{geo.Country}, {geo.City}" : "Не определено";
-                    string isp = geo?.Isp ?? "-";
-                    string org = geo?.Org ?? geo?.As ?? "-";
-
-                    var item = new ConnectionItem
-                    {
-                        Time = DateTime.Now.ToString("HH:mm:ss"),
-                        Source = "🔴 LIVE (Сессия)",
-                        Ip = ip,
-                        Location = loc,
-                        Isp = isp,
-                        Org = org,
-                        Details = $"Remote Port: {port} (PID: {pid})",
-                        Geo = geo
-                    };
-
-                    allItems.Insert(0, item);
-                    grid.Rows.Insert(0, item.Time, item.Source, item.Ip, item.Location, item.Isp, item.Org, item.Details);
-                    grid.Rows[0].DefaultCellStyle.BackColor = Color.FromArgb(255, 235, 238);
-                    grid.Rows[0].DefaultCellStyle.ForeColor = Color.FromArgb(198, 40, 40);
-                }
-            }
-        }
-
-        private async Task ScanLogsAsync()
-        {
-            lblStatus.Text = "Чтение лог-файлов AnyDesk...";
-            var logItems = ParseAnyDeskLogs();
-            if (logItems.Count == 0)
-            {
-                MessageBox.Show("Логи AnyDesk не найдены или в них нет внешних подключений.", "Информация", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                lblStatus.Text = "Логи пусты.";
+                FindActiveLogFile();
                 return;
             }
 
-            lblStatus.Text = $"Найдено {logItems.Count} записей. Запрос GeoIP...";
-            foreach (var item in logItems)
+            try
             {
-                if (!seenIps.Contains(item.Ip))
+                var fi = new FileInfo(activeLogPath);
+                if (fi.Length > lastLogPosition)
                 {
-                    seenIps.Add(item.Ip);
-                    item.Geo = await FetchGeoIpAsync(item.Ip);
-                    if (item.Geo?.Status == "success")
+                    using (var fs = new FileStream(activeLogPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
                     {
-                        item.Location = $"{item.Geo.Country}, {item.Geo.City}";
-                        item.Isp = item.Geo.Isp ?? "-";
-                        item.Org = item.Geo.Org ?? item.Geo.As ?? "-";
+                        fs.Seek(lastLogPosition, SeekOrigin.Begin);
+                        using (var sr = new StreamReader(fs, Encoding.UTF8))
+                        {
+                            string? line;
+                            while ((line = sr.ReadLine()) != null)
+                            {
+                                var ev = TryParseSessionLine(line, Path.GetFileName(activeLogPath));
+                                if (ev != null)
+                                {
+                                    string key = $"{ev.Timestamp}_{ev.RemoteAnyDeskId}_{ev.EventType}";
+                                    if (!seenSessionKeys.Contains(key))
+                                    {
+                                        seenSessionKeys.Add(key);
+                                        System.Media.SystemSounds.Hand.Play();
+
+                                        if (ev.RemoteIp != "Через релей AnyDesk" && !IsPrivateIp(ev.RemoteIp))
+                                        {
+                                            ev.Geo = await FetchGeoIpAsync(ev.RemoteIp);
+                                            if (ev.Geo?.Status == "success")
+                                            {
+                                                ev.Location = $"{ev.Geo.Country}, {ev.Geo.City}";
+                                                ev.IspOrg = $"{ev.Geo.Isp} ({ev.Geo.Org ?? ev.Geo.As})";
+                                            }
+                                        }
+
+                                        sessionList.Insert(0, ev);
+                                        grid.Rows.Insert(0, ev.Timestamp, ev.EventType, ev.RemoteAnyDeskId, ev.RemoteIp, ev.ConnectionType, ev.Location, ev.IspOrg);
+                                        grid.Rows[0].DefaultCellStyle.BackColor = Color.FromArgb(255, 235, 238);
+                                        grid.Rows[0].DefaultCellStyle.ForeColor = Color.FromArgb(198, 40, 40);
+
+                                        lblStatus.Text = $"🚨 ВНИМАНИЕ: Зафиксировано событие AnyDesk ID: {ev.RemoteAnyDeskId} ({ev.EventType})!";
+                                        lblStatus.ForeColor = Color.Red;
+                                    }
+                                }
+                            }
+                            lastLogPosition = fs.Position;
+                        }
                     }
-                    allItems.Add(item);
-                    grid.Rows.Add(item.Time, item.Source, item.Ip, item.Location, item.Isp, item.Org, item.Details);
-                    await Task.Delay(250);
                 }
             }
-            lblStatus.Text = $"История логов загружена ({grid.Rows.Count} строк).";
+            catch { }
+        }
+
+        private async Task LoadActualSessionsFromLogsAsync()
+        {
+            lblStatus.Text = "Поиск реальных сессий в логах AnyDesk...";
+            sessionList.Clear();
+            seenSessionKeys.Clear();
+            grid.Rows.Clear();
+
+            var logs = new List<string>();
+            string? appdata = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+            if (!string.IsNullOrEmpty(appdata))
+            {
+                logs.Add(Path.Combine(appdata, "AnyDesk", "ad.trace"));
+                logs.Add(Path.Combine(appdata, "AnyDesk", "connection_trace.txt"));
+            }
+            string? progData = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
+            if (!string.IsNullOrEmpty(progData))
+            {
+                logs.Add(Path.Combine(progData, "AnyDesk", "ad_svc.trace"));
+                logs.Add(Path.Combine(progData, "AnyDesk", "ad.trace"));
+            }
+
+            foreach (var logFile in logs)
+            {
+                if (!File.Exists(logFile)) continue;
+                try
+                {
+                    using var fs = new FileStream(logFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                    using var sr = new StreamReader(fs, Encoding.UTF8);
+                    string? line;
+                    while ((line = sr.ReadLine()) != null)
+                    {
+                        var ev = TryParseSessionLine(line, Path.GetFileName(logFile));
+                        if (ev != null)
+                        {
+                            string key = $"{ev.Timestamp}_{ev.RemoteAnyDeskId}_{ev.EventType}";
+                            if (!seenSessionKeys.Contains(key))
+                            {
+                                seenSessionKeys.Add(key);
+                                sessionList.Add(ev);
+                            }
+                        }
+                    }
+                }
+                catch { }
+            }
+
+            if (sessionList.Count == 0)
+            {
+                MessageBox.Show("В логах не найдено реальных входящих сессий.\n(Служебные системные соединения отфильтрованы).", "Информация", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                lblStatus.Text = "Реальных сессий не зафиксировано.";
+                return;
+            }
+
+            lblStatus.Text = $"Найдено {sessionList.Count} реальных сессий. Определение GeoIP...";
+
+            foreach (var ev in sessionList)
+            {
+                if (ev.RemoteIp != "Через релей AnyDesk" && !IsPrivateIp(ev.RemoteIp))
+                {
+                    ev.Geo = await FetchGeoIpAsync(ev.RemoteIp);
+                    if (ev.Geo?.Status == "success")
+                    {
+                        ev.Location = $"{ev.Geo.Country}, {ev.Geo.City}";
+                        ev.IspOrg = $"{ev.Geo.Isp} ({ev.Geo.Org ?? ev.Geo.As})";
+                    }
+                    await Task.Delay(200);
+                }
+                grid.Rows.Add(ev.Timestamp, ev.EventType, ev.RemoteAnyDeskId, ev.RemoteIp, ev.ConnectionType, ev.Location, ev.IspOrg);
+            }
+
+            lblStatus.Text = $"Загружено {sessionList.Count} подтвержденных сеансов AnyDesk.";
+        }
+
+        private SessionEvent? TryParseSessionLine(string line, string fileName)
+        {
+            string lower = line.ToLowerInvariant();
+
+            // Исключаем фоновые служебные строки (пинг серверов, резолв DNS, токены)
+            if (lower.Contains("checking for updates") || lower.Contains("heartbeat") || 
+                lower.Contains("license check") || lower.Contains("stun response"))
+                return null;
+
+            bool isIncomingRequest = lower.Contains("incoming session request") || lower.Contains("request from");
+            bool isLoggedIn = lower.Contains("logged in from") || lower.Contains("user-id:");
+            bool isAccepted = lower.Contains("session accepted") || lower.Contains("session started");
+            bool isRejected = lower.Contains("session closed") || lower.Contains("session terminated") || lower.Contains("rejected");
+
+            if (!isIncomingRequest && !isLoggedIn && !isAccepted && !isRejected)
+                return null;
+
+            // Извлечение AnyDesk ID (7-10 цифр)
+            var idMatch = Regex.Match(line, @"(?:Logged in from|User-ID:|request:\s*|from\s+|ad:)(\d{7,10})", RegexOptions.IgnoreCase);
+            if (!idMatch.Success)
+            {
+                // Если нет ID оператора в строке, проверяем наличие ключевого слова сессии
+                if (!lower.Contains("session")) return null;
+            }
+
+            string anyId = idMatch.Success ? idMatch.Groups[1].Value : "Не указан";
+
+            // Извлечение внешнего IP, если есть в строке
+            var ipMatch = Regex.Match(line, @"\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b");
+            string ip = "Через релей AnyDesk";
+            string connType = "Relay (Сервер AnyDesk)";
+
+            if (ipMatch.Success && !IsPrivateIp(ipMatch.Value))
+            {
+                ip = ipMatch.Value;
+                connType = lower.Contains("p2p") || lower.Contains("direct") ? "Прямое P2P" : "Релей / Внешний IP";
+            }
+
+            string eventType = "Сессия";
+            if (isIncomingRequest) eventType = "🔔 Запрос на подключение";
+            else if (isLoggedIn) eventType = "🔑 Успешный вход в систему";
+            else if (isAccepted) eventType = "🟢 Сессия начата";
+            else if (isRejected) eventType = "🔴 Сессия завершена / Отклонена";
+
+            string timeStr = line.Length >= 19 ? line.Substring(0, 19) : DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+
+            return new SessionEvent
+            {
+                Timestamp = timeStr,
+                EventType = eventType,
+                RemoteAnyDeskId = anyId,
+                RemoteIp = ip,
+                ConnectionType = connType,
+                LogSource = fileName
+            };
         }
 
         private void KillAnyDesk()
         {
             try
             {
-                int killed = 0;
+                int count = 0;
                 foreach (var p in Process.GetProcessesByName("AnyDesk"))
                 {
                     p.Kill();
-                    killed++;
+                    count++;
                 }
-                MessageBox.Show($"Процессы AnyDesk успешно завершены ({killed} шт.)!", "Экстренная остановка", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                lblStatus.Text = "🛑 Все процессы AnyDesk принудительно завершены!";
+                MessageBox.Show($"Процессы AnyDesk ({count} шт.) экстренно закрыты!", "Сброс сессии", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                lblStatus.Text = "🛑 Процессы AnyDesk сброшены!";
                 lblStatus.ForeColor = Color.Red;
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"Ошибка завершения: {ex.Message}", "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                MessageBox.Show($"Ошибка: {ex.Message}", "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
 
         private void ExportHtmlReport()
         {
-            if (allItems.Count == 0)
+            if (sessionList.Count == 0)
             {
-                MessageBox.Show("Нет данных для отчета. Сначала запустите мониторинг или историю.", "Внимание", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show("Нет данных для отчета. Сначала найдите сессии.", "Внимание", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
 
             var sfd = new SaveFileDialog
             {
                 Filter = "HTML Files (*.html)|*.html",
-                FileName = $"AnyDesk_Report_{DateTime.Now:yyyyMMdd_HHmmss}.html"
+                FileName = $"AnyDesk_Verified_Report_{DateTime.Now:yyyyMMdd_HHmmss}.html"
             };
 
             if (sfd.ShowDialog() == DialogResult.OK)
             {
                 var sb = new StringBuilder();
-                sb.AppendLine("<!DOCTYPE html><html><head><meta charset='UTF-8'><title>Отчет AnyDesk</title>");
+                sb.AppendLine("<!DOCTYPE html><html lang='ru'><head><meta charset='UTF-8'><title>Отчет по сессиям AnyDesk</title>");
                 sb.AppendLine("<style>body{font-family:sans-serif;margin:30px;background:#f8f9fa} table{width:100%;border-collapse:collapse;background:#fff} th,td{padding:10px;border:1px solid #ddd;text-align:left} th{background:#e9ecef}</style></head><body>");
-                sb.AppendLine($"<h2>Отчет по подключениям AnyDesk ({DateTime.Now})</h2><table>");
-                sb.AppendLine("<tr><th>Время</th><th>Тип</th><th>IP</th><th>Локация</th><th>Провайдер</th><th>Организация</th><th>Детали</th></tr>");
-                foreach (var it in allItems)
+                sb.AppendLine($"<h2>Подтвержденные сессии AnyDesk ({DateTime.Now})</h2>");
+                sb.AppendLine("<table><tr><th>Время</th><th>Статус</th><th>AnyDesk ID оператора</th><th>IP-адрес</th><th>Тип связи</th><th>Локация</th><th>Провайдер</th></tr>");
+                foreach (var ev in sessionList)
                 {
-                    sb.AppendLine($"<tr><td>{it.Time}</td><td>{it.Source}</td><td><b>{it.Ip}</b></td><td>{it.Location}</td><td>{it.Isp}</td><td>{it.Org}</td><td>{it.Details}</td></tr>");
+                    sb.AppendLine($"<tr><td>{ev.Timestamp}</td><td>{ev.EventType}</td><td><b>{ev.RemoteAnyDeskId}</b></td><td>{ev.RemoteIp}</td><td>{ev.ConnectionType}</td><td>{ev.Location}</td><td>{ev.IspOrg}</td></tr>");
                 }
                 sb.AppendLine("</table></body></html>");
                 File.WriteAllText(sfd.FileName, sb.ToString(), Encoding.UTF8);
@@ -342,39 +478,6 @@ namespace AnyDeskInspector
             }
         }
 
-        private void ExportPoliceStatement()
-        {
-            if (allItems.Count == 0)
-            {
-                MessageBox.Show("Нет данных для формирования заявления.", "Внимание", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return;
-            }
-
-            var sfd = new SaveFileDialog
-            {
-                Filter = "Text Files (*.txt)|*.txt",
-                FileName = $"Police_Statement_{DateTime.Now:yyyyMMdd_HHmmss}.txt"
-            };
-
-            if (sfd.ShowDialog() == DialogResult.OK)
-            {
-                var sb = new StringBuilder();
-                sb.AppendLine("В Орган внутренних дел / Службу безопасности Банка\n");
-                sb.AppendLine("                           ЗАЯВЛЕНИЕ");
-                sb.AppendLine(" о несанкционированном удаленном доступе через AnyDesk\n");
-                sb.AppendLine($"Компьютер: {Environment.MachineName} (Пользователь: {Environment.UserName})");
-                sb.AppendLine($"Дата формирования: {DateTime.Now:dd.MM.yyyy HH:mm:ss}\n");
-                sb.AppendLine("ФИКСИРОВАННЫЕ ВНЕШНИЕ ПОДКЛЮЧЕНИЯ:");
-                foreach (var it in allItems)
-                {
-                    sb.AppendLine($"• [{it.Time}] IP: {it.Ip} | Локация: {it.Location} | Провайдер: {it.Isp} | {it.Details}");
-                }
-                File.WriteAllText(sfd.FileName, sb.ToString(), Encoding.UTF8);
-                Process.Start(new ProcessStartInfo(sfd.FileName) { UseShellExecute = true });
-            }
-        }
-
-        #region Helpers & Network
         private async Task<GeoIpResponse?> FetchGeoIpAsync(string ip)
         {
             try
@@ -384,116 +487,6 @@ namespace AnyDeskInspector
                 return JsonSerializer.Deserialize<GeoIpResponse>(res);
             }
             catch { return null; }
-        }
-
-        private static List<ConnectionItem> ParseAnyDeskLogs()
-        {
-            var list = new List<ConnectionItem>();
-            string? appdata = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
-            var paths = new List<string>();
-            if (!string.IsNullOrEmpty(appdata))
-            {
-                paths.Add(Path.Combine(appdata, "AnyDesk", "ad.trace"));
-                paths.Add(Path.Combine(appdata, "AnyDesk", "connection_trace.txt"));
-            }
-
-            var ipRegex = new Regex(@"\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b");
-            var idRegex = new Regex(@"(?:Logged in from|User-ID|Incoming session request:|Client-ID:|ad:)\s*(\d{7,10})", RegexOptions.IgnoreCase);
-
-            foreach (var p in paths)
-            {
-                if (!File.Exists(p)) continue;
-                try
-                {
-                    using var fs = new FileStream(p, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-                    using var sr = new StreamReader(fs, Encoding.UTF8);
-                    string? line;
-                    while ((line = sr.ReadLine()) != null)
-                    {
-                        string lower = line.ToLowerInvariant();
-                        if (lower.Contains("logged in") || lower.Contains("incoming session") || lower.Contains("external ip") || lower.Contains("p2p"))
-                        {
-                            var m = ipRegex.Match(line);
-                            if (m.Success && !IsPrivateIp(m.Value))
-                            {
-                                string anyId = "";
-                                var idM = idRegex.Match(line);
-                                if (idM.Success) anyId = $"ID: {idM.Groups[1].Value}";
-
-                                list.Add(new ConnectionItem
-                                {
-                                    Time = line.Length >= 19 ? line.Substring(0, 19) : "",
-                                    Source = "📜 Лог",
-                                    Ip = m.Value,
-                                    Details = $"{anyId} ({Path.GetFileName(p)})"
-                                });
-                            }
-                        }
-                    }
-                }
-                catch { }
-            }
-            return list;
-        }
-
-        private static List<(string Ip, int Port, uint Pid)> GetActiveAnyDeskConnections()
-        {
-            var results = new List<(string, int, uint)>();
-            var pids = new HashSet<int>();
-            foreach (var p in Process.GetProcessesByName("AnyDesk")) pids.Add(p.Id);
-            if (pids.Count == 0) return results;
-
-            var rows = GetAllTcpConnections();
-            foreach (var row in rows)
-            {
-                if (pids.Contains((int)row.owningPid) && row.state == 5) // Established
-                {
-                    string remoteIp = new IPAddress(row.remoteAddr).ToString();
-                    int remotePort = (ushort)IPAddress.NetworkToHostOrder((short)row.remotePort);
-                    if (!IsPrivateIp(remoteIp))
-                    {
-                        results.Add((remoteIp, remotePort, row.owningPid));
-                    }
-                }
-            }
-            return results;
-        }
-
-        [DllImport("iphlpapi.dll", SetLastError = true)]
-        private static extern uint GetExtendedTcpTable(IntPtr pTcpTable, ref int pdwSize, bool bOrder, int ulAf, int TableClass, uint Reserved = 0);
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct MIB_TCPROW_OWNER_PID
-        {
-            public uint state;
-            public uint localAddr;
-            public uint localPort;
-            public uint remoteAddr;
-            public uint remotePort;
-            public uint owningPid;
-        }
-
-        private static List<MIB_TCPROW_OWNER_PID> GetAllTcpConnections()
-        {
-            var rows = new List<MIB_TCPROW_OWNER_PID>();
-            int bufferSize = 0;
-            GetExtendedTcpTable(IntPtr.Zero, ref bufferSize, true, 2, 5, 0);
-            IntPtr ptr = Marshal.AllocHGlobal(bufferSize);
-            try
-            {
-                if (GetExtendedTcpTable(ptr, ref bufferSize, true, 2, 5, 0) == 0)
-                {
-                    int count = Marshal.ReadInt32(ptr);
-                    IntPtr rowPtr = (IntPtr)((long)ptr + 4);
-                    for (int i = 0; i < count; i++)
-                    {
-                        rows.Add(Marshal.PtrToStructure<MIB_TCPROW_OWNER_PID>(rowPtr));
-                        rowPtr = (IntPtr)((long)rowPtr + Marshal.SizeOf(typeof(MIB_TCPROW_OWNER_PID)));
-                    }
-                }
-            }
-            finally { Marshal.FreeHGlobal(ptr); }
-            return rows;
         }
 
         private static bool IsPrivateIp(string ipStr)
@@ -509,7 +502,6 @@ namespace AnyDeskInspector
             }
             return true;
         }
-        #endregion
 
         [STAThread]
         static void Main()
