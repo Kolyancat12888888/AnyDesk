@@ -1,0 +1,11 @@
+bin/
+obj/
+*.user
+*.suo
+.vs/
+Forensic_Report_*.html
+Police_Statement_*.txt
+Forensic_Data_*.json
+anydesk_report_*.html
+anydesk_report_*.txt
+config.json
